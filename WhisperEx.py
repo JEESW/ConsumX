@@ -1,273 +1,196 @@
 import os
+import gc
+import json
 import argparse
-import subprocess
 from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import Optional, List, Tuple, Dict, Any
 
 import torch
-import whisper
-from pyannote.audio import Pipeline
+import whisperx
+from whisperx.diarize import DiarizationPipeline
 
 
-# ===== pyannote diarization 모델 (HF에서 약관 동의 필요) =====
-DIAR_MODEL = "pyannote/speaker-diarization-3.1"
-
-# diarization 구간 후처리(합치기) 파라미터
-MIN_SEGMENT_SEC = 1.5   # 너무 짧은 구간은 버림
-MERGE_GAP_SEC = 1.2     # 같은 화자 구간 사이의 간격이 이보다 작으면 합침
-MAX_SEGMENT_SEC = 30.0   # 너무 길면 쪼개기
-
-@dataclass
-class Segment:
-    start: float
-    end: float
-    speaker: str
-
-def run_ffmpeg_cut(src: Path, out_wav: Path, start: float, end: float) -> None:
-    """
-    src에서 [start, end] 구간을 잘라 out_wav로 저장 (16kHz mono wav)
-    """
-    out_wav.parent.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(src),
-        "-ss", f"{start:.3f}",
-        "-to", f"{end:.3f}",
-        "-vn",
-        "-ac", "1",
-        "-ar", "16000",
-        str(out_wav),
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg cut failed:\nCMD: {' '.join(cmd)}\nSTDERR:\n{proc.stderr}"
-        )
-
-def ensure_wav_16k_mono(src: Path, out_wav: Path) -> Path:
-    """
-    pyannote/torchaudio가 잘 읽도록 src를 16kHz mono wav로 변환.
-    이미 wav면 그대로 반환.
-    """
-    if src.suffix.lower() == ".wav":
-        return src
-
-    out_wav.parent.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(src),
-        "-vn",
-        "-ac", "1",
-        "-ar", "16000",
-        str(out_wav),
-    ]
-    
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg convert failed:\nCMD: {' '.join(cmd)}\nSTDERR:\n{proc.stderr}"
-        )
-        
-    return out_wav
-
-def diarize_audio(
-    audio_path: Path,
-    hf_token: str,
-    device: str,
-    num_speakers: Optional[int] = None,
-    min_speakers: Optional[int] = None,
-    max_speakers: Optional[int] = None,
-) -> List[Segment]:
-    """
-    pyannote로 화자 분리 후 Segment 리스트 반환
-    """
-    pipeline = Pipeline.from_pretrained(DIAR_MODEL, use_auth_token=hf_token)
-
-    # 버전에 따라 pipeline.to() 지원 여부가 달라서 try 처리
-    try:
-        pipeline.to(torch.device(device))
-    except Exception:
-        pass
-
-    # pyannote는 보통 {"audio": "..."} 형태 입력 권장
-    file_dict = {"audio": str(audio_path)}
-
-    # 힌트 kwargs 구성 (없으면 빈 dict -> 자동 추정)
-    kwargs = {}
-
-    if num_speakers is not None:
-        if num_speakers <= 0:
-            raise ValueError("--num-speakers는 1 이상의 정수여야 합니다.")
-        kwargs["num_speakers"] = num_speakers
-    else:
-        # num_speakers가 없을 때만 min/max 적용
-        if min_speakers is not None:
-            if min_speakers <= 0:
-                raise ValueError("--min-speakers는 1 이상의 정수여야 합니다.")
-            kwargs["min_speakers"] = min_speakers
-        if max_speakers is not None:
-            if max_speakers <= 0:
-                raise ValueError("--max-speakers는 1 이상의 정수여야 합니다.")
-            kwargs["max_speakers"] = max_speakers
-
-        if (min_speakers is not None) and (max_speakers is not None) and (min_speakers > max_speakers):
-            raise ValueError("--min-speakers는 --max-speakers보다 클 수 없습니다.")
-
-    if kwargs:
-        print(f"[INFO] diarization speaker hint: {kwargs}")
-    else:
-        print("[INFO] diarization speaker hint: (auto)")
-
-    diar = pipeline(file_dict, **kwargs)
-
-    segs: List[Segment] = []
-    for turn, _, speaker in diar.itertracks(yield_label=True):
-        start = float(turn.start)
-        end = float(turn.end)
-        if end - start >= MIN_SEGMENT_SEC:
-            segs.append(Segment(start=start, end=end, speaker=speaker))
-
-    return segs
+def seconds_to_hhmmss(seconds: float) -> str:
+    total_ms = int(round(seconds * 1000))
+    h = total_ms // 3_600_000
+    m = (total_ms % 3_600_000) // 60_000
+    s = (total_ms % 60_000) / 1000.0
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
-def merge_segments(segments: List[Segment], merge_gap: float = MERGE_GAP_SEC) -> List[Segment]:
-    """
-    diarization 결과가 잘게 쪼개지므로:
-    - 같은 speaker가 연속으로 등장하고
-    - gap이 merge_gap 이하이면
-    => 하나로 합친다.
-    """
-    if not segments:
-        return []
-
-    segments = sorted(segments, key=lambda s: (s.start, s.end))
-    merged: List[Segment] = [segments[0]]
-
-    for seg in segments[1:]:
-        prev = merged[-1]
-        if seg.speaker == prev.speaker and seg.start - prev.end <= merge_gap:
-            prev.end = max(prev.end, seg.end)
-        else:
-            merged.append(seg)
-
-    # 합친 뒤에도 너무 짧으면 제거
-    merged = [s for s in merged if (s.end - s.start) >= MIN_SEGMENT_SEC]
-    return merged
+def normalize_path(base_dir: Path, path_str: str) -> Path:
+    p = Path(path_str)
+    if not p.is_absolute():
+        p = (base_dir / p).resolve()
+    return p
 
 
-def split_long_segments(segs, max_len=30.0):
-    """
-    max_len을 기준으로 너무 긴 구간은 자름
-    """
-    out=[]
-    for s in segs:
-        cur=s.start
-        while s.end-cur > max_len:
-            out.append(Segment(cur, cur+max_len, s.speaker))
-            cur += max_len
-        out.append(Segment(cur, s.end, s.speaker))
-    return out
+def cleanup_cuda():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
-def stt_by_speaker(
-    audio_path: Path,
-    segments: List[Segment],
-    whisper_model: whisper.Whisper,
-    device: str,
-    language: str,
-    out_dir: Path
-) -> List[Tuple[str, float, float, str]]:
-    """
-    (speaker, start, end, text) 형태로 결과 반환
-    """
-    tmp_dir = out_dir / "_tmp_segments"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+def validate_speaker_args(
+    num_speakers: Optional[int],
+    min_speakers: Optional[int],
+    max_speakers: Optional[int],
+) -> None:
+    if num_speakers is not None and num_speakers <= 0:
+        raise ValueError("--num-speakers는 1 이상의 정수여야 합니다.")
+    if min_speakers is not None and min_speakers <= 0:
+        raise ValueError("--min-speakers는 1 이상의 정수여야 합니다.")
+    if max_speakers is not None and max_speakers <= 0:
+        raise ValueError("--max-speakers는 1 이상의 정수여야 합니다.")
+    if (
+        min_speakers is not None
+        and max_speakers is not None
+        and min_speakers > max_speakers
+    ):
+        raise ValueError("--min-speakers는 --max-speakers보다 클 수 없습니다.")
+    if num_speakers is not None and (min_speakers is not None or max_speakers is not None):
+        print("[WARN] --num-speakers가 지정되면 --min-speakers/--max-speakers는 무시됩니다.")
 
-    use_fp16 = (device == "cuda")
-    results: List[Tuple[str, float, float, str]] = []
 
-    for idx, seg in enumerate(segments, 1):
-        start, end, speaker = seg.start, seg.end, seg.speaker
+def pick_compute_type(device: str, user_compute_type: Optional[str]) -> str:
+    if user_compute_type:
+        return user_compute_type
 
-        seg_wav = tmp_dir / f"seg_{idx:05d}_{speaker}.wav"
-        run_ffmpeg_cut(audio_path, seg_wav, start, end)
+    if device == "cuda":
+        return "float16"
+    return "int8"
 
-        r = whisper_model.transcribe(
-            str(seg_wav),
-            language=language,
-            fp16=use_fp16,
-            verbose=False,
-            # 더 안정적으로 만들고 싶으면:
-            # condition_on_previous_text=False,
-            # temperature=0.0,
-        )
-        text = (r.get("text") or "").strip()
+
+def extract_timeline_rows(result: Dict[str, Any]) -> List[Tuple[str, float, float, str]]:
+    rows: List[Tuple[str, float, float, str]] = []
+
+    for seg in result.get("segments", []):
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", 0.0))
+        text = (seg.get("text") or "").strip()
+        speaker = seg.get("speaker") or "SPEAKER_UNKNOWN"
+
         if text:
-            results.append((speaker, start, end, text))
+            rows.append((speaker, start, end, text))
 
-    return results
+    rows.sort(key=lambda x: (x[1], x[2]))
+    return rows
 
 
-def write_outputs(out_dir: Path, stt_rows: List[Tuple[str, float, float, str]]) -> None:
-    """
-    1) 시간순 화자별 대화 로그
-    2) 화자별로 모아보기
-    """
+def write_outputs(
+    out_dir: Path,
+    result: Dict[str, Any],
+    rows: List[Tuple[str, float, float, str]],
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) 시간순 로그
+    # 1) 시간순 화자별 로그
     timeline_path = out_dir / "transcript_by_speaker_timeline.txt"
-    lines = [
+    timeline_lines = [
         f"{speaker} ({start:.1f}-{end:.1f}) : {text}"
-        for speaker, start, end, text in stt_rows
+        for speaker, start, end, text in rows
     ]
-    timeline_path.write_text("\n".join(lines), encoding="utf-8")
+    timeline_path.write_text("\n".join(timeline_lines), encoding="utf-8")
 
-    # 2) 화자별 모아보기
-    by_speaker = {}
-    for speaker, start, end, text in stt_rows:
+    # 2) 화자별로 모아보기
+    grouped_path = out_dir / "transcript_by_speaker_grouped.txt"
+    by_speaker: Dict[str, List[Tuple[float, float, str]]] = {}
+    for speaker, start, end, text in rows:
         by_speaker.setdefault(speaker, []).append((start, end, text))
 
-    grouped_path = out_dir / "transcript_by_speaker_grouped.txt"
-    grouped_lines = []
+    grouped_lines: List[str] = []
     for speaker in sorted(by_speaker.keys()):
         grouped_lines.append(f"===== {speaker} =====")
         for start, end, text in by_speaker[speaker]:
             grouped_lines.append(f"({start:.1f}-{end:.1f}) {text}")
-        grouped_lines.append("")  # blank line
+        grouped_lines.append("")
 
     grouped_path.write_text("\n".join(grouped_lines).rstrip() + "\n", encoding="utf-8")
 
-    print(f"[DONE] saved:\n- {timeline_path}\n- {grouped_path}")
+    # 3) WhisperX raw JSON 저장
+    json_path = out_dir / "whisperx_result.json"
+    json_path.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    # 4) 좀 더 보기 쉬운 상세 로그
+    detailed_path = out_dir / "transcript_detailed.txt"
+    detailed_lines: List[str] = []
+    for idx, seg in enumerate(result.get("segments", []), 1):
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", 0.0))
+        speaker = seg.get("speaker") or "SPEAKER_UNKNOWN"
+        text = (seg.get("text") or "").strip()
+
+        detailed_lines.append(
+            f"[{idx:04d}] {speaker} | {seconds_to_hhmmss(start)} ~ {seconds_to_hhmmss(end)}"
+        )
+        detailed_lines.append(text)
+
+        words = seg.get("words") or []
+        if words:
+            detailed_lines.append("  - words:")
+            for w in words:
+                w_start = w.get("start")
+                w_end = w.get("end")
+                w_word = (w.get("word") or "").strip()
+                w_speaker = w.get("speaker")
+
+                span = ""
+                if w_start is not None and w_end is not None:
+                    span = f"{float(w_start):.2f}-{float(w_end):.2f}"
+
+                if w_speaker:
+                    detailed_lines.append(f"    * [{span}] ({w_speaker}) {w_word}")
+                else:
+                    detailed_lines.append(f"    * [{span}] {w_word}")
+
+        detailed_lines.append("")
+
+    detailed_path.write_text("\n".join(detailed_lines).rstrip() + "\n", encoding="utf-8")
+
+    print("[DONE] saved:")
+    print(f"- {timeline_path}")
+    print(f"- {grouped_path}")
+    print(f"- {json_path}")
+    print(f"- {detailed_path}")
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="pyannote diarization + whisper STT -> speaker-labeled transcript"
+        description="WhisperX diarization + alignment + speaker-labeled transcript"
     )
     p.add_argument(
         "--audio",
         required=True,
-        help="입력 오디오 파일 경로 (예: meeting.wav)"
+        help="입력 오디오 파일 경로 (예: meeting.wav, meeting.m4a)"
     )
     p.add_argument(
         "--model",
         default="small",
-        help="Whisper 모델명 (tiny/base/small/medium/large)"
+        help="WhisperX ASR 모델명 (예: tiny, base, small, medium, large-v2, large-v3)"
     )
     p.add_argument(
         "--lang",
-        default="ko",
-        help="언어 코드 (예: ko, en)"
+        default=None,
+        help="언어 코드 (예: ko, en). 지정하지 않으면 자동 감지"
     )
     p.add_argument(
         "--out",
         default="outputs",
         help="출력 폴더명 (기본: outputs)"
+    )
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="배치 크기 (GPU 메모리 부족 시 줄이기)"
+    )
+    p.add_argument(
+        "--compute-type",
+        default=None,
+        help="연산 타입 (예: float16, int8, int8_float16). 미지정 시 device 기준 자동 선택"
     )
     p.add_argument(
         "--num-speakers",
@@ -287,80 +210,142 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="최대 화자 수 (예: 5)"
     )
+    p.add_argument(
+        "--no-diarize",
+        action="store_true",
+        help="화자 분리를 끄고 순수 STT + alignment만 수행"
+    )
+    p.add_argument(
+        "--device",
+        default=None,
+        help="실행 디바이스 강제 지정 (cuda / cpu)"
+    )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-
-    # HF 토큰은 환경변수에서만 읽음
-    hf_token = os.environ.get("HF_TOKEN")
-    if not hf_token:
-        raise RuntimeError(
-            "HF_TOKEN 환경변수가 없습니다.\n"
-            "PowerShell:  $env:HF_TOKEN=\"<토큰>\"\n"
-            "CMD:        set HF_TOKEN=<토큰>\n"
-        )
+    validate_speaker_args(args.num_speakers, args.min_speakers, args.max_speakers)
 
     base_dir = Path(__file__).resolve().parent
-
-    audio_path = Path(args.audio)
-    if not audio_path.is_absolute():
-        audio_path = (base_dir / audio_path).resolve()
+    audio_path = normalize_path(base_dir, args.audio)
+    out_dir = normalize_path(base_dir, args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     if not audio_path.exists():
         raise FileNotFoundError(f"입력 파일이 없습니다: {audio_path}")
 
-    out_dir = Path(args.out)
-    if not out_dir.is_absolute():
-        out_dir = (base_dir / out_dir).resolve()
-    out_dir.mkdir(exist_ok=True)
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    compute_type = pick_compute_type(device, args.compute_type)
 
-    # GPU 체크
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[INFO] device = {device}")
     if device == "cuda":
         print(f"[INFO] gpu = {torch.cuda.get_device_name(0)}")
     else:
         print("[WARN] GPU를 못 잡았습니다. CPU로 실행됩니다(느릴 수 있음).")
-        
-    # pyannote가 m4a 같은 형식을 못 읽는 경우가 있어 wav로 변환해서 사용
-    wav_for_diar = out_dir / "input_for_diarization.wav"
-    audio_for_diar = ensure_wav_16k_mono(audio_path, wav_for_diar)
+    print(f"[INFO] compute_type = {compute_type}")
 
-    # 1) diarization
-    print("[INFO] diarization(pyannote) running...")
-    segs = diarize_audio(audio_for_diar, hf_token, device, args.num_speakers, args.min_speakers, args.max_speakers)
-    print(f"[INFO] diarization raw segments = {len(segs)}")
+    hf_token = os.environ.get("HF_TOKEN")
+    if not args.no_diarize and not hf_token:
+        raise RuntimeError(
+            "화자 분리를 사용하려면 HF_TOKEN 환경변수가 필요합니다.\n"
+            "PowerShell:  $env:HF_TOKEN=\"<토큰>\"\n"
+            "CMD:         set HF_TOKEN=<토큰>\n"
+            "또한 Hugging Face에서 pyannote diarization 모델 약관 동의가 필요합니다."
+        )
 
-    segs = merge_segments(segs)
-    print(f"[INFO] diarization merged segments = {len(segs)}")
-    
-    segs = split_long_segments(segs)
-    print(f"[INFO] diarization splited segments = {len(segs)}")
+    # 1) 오디오 로드
+    print("[INFO] loading audio...")
+    audio = whisperx.load_audio(str(audio_path))
 
-    if not segs:
-        raise RuntimeError("diarization 결과 세그먼트가 없습니다. (오디오/모델/환경 확인)")
-
-    # 2) whisper load
-    print(f"[INFO] whisper model load: {args.model}")
-    w = whisper.load_model(args.model, device=device)
-
-    # 3) STT per speaker segment
-    print("[INFO] STT per speaker segments...")
-    rows = stt_by_speaker(
-        audio_path=audio_path,
-        segments=segs,
-        whisper_model=w,
+    # 2) ASR
+    print(f"[INFO] loading whisperx model: {args.model}")
+    asr_model = whisperx.load_model(
+        args.model,
         device=device,
+        compute_type=compute_type,
         language=args.lang,
-        out_dir=out_dir
     )
 
-    # 4) save
-    write_outputs(out_dir, rows)
+    print("[INFO] transcribing...")
+    result = asr_model.transcribe(
+        audio,
+        batch_size=args.batch_size,
+    )
 
-    # preview
+    print(f"[INFO] detected language = {result.get('language')}")
+    print(f"[INFO] raw segments = {len(result.get('segments', []))}")
+
+    # ASR 모델 메모리 해제
+    del asr_model
+    cleanup_cuda()
+
+    # 3) Alignment
+    language_code = args.lang or result.get("language")
+    if not language_code:
+        raise RuntimeError("언어를 판별하지 못했습니다. --lang 옵션을 직접 지정해보세요.")
+
+    print(f"[INFO] loading align model for language = {language_code}")
+    align_model, metadata = whisperx.load_align_model(
+        language_code=language_code,
+        device=device,
+    )
+
+    print("[INFO] aligning...")
+    result = whisperx.align(
+        result["segments"],
+        align_model,
+        metadata,
+        audio,
+        device,
+        return_char_alignments=False,
+    )
+
+    print(f"[INFO] aligned segments = {len(result.get('segments', []))}")
+
+    # align 모델 메모리 해제
+    del align_model
+    cleanup_cuda()
+
+    # 4) Diarization
+    if not args.no_diarize:
+        print("[INFO] diarization running...")
+        diarize_model = DiarizationPipeline(
+            token=hf_token,
+            device=device,
+        )
+
+        diar_kwargs = {}
+        if args.num_speakers is not None:
+            diar_kwargs["num_speakers"] = args.num_speakers
+        else:
+            if args.min_speakers is not None:
+                diar_kwargs["min_speakers"] = args.min_speakers
+            if args.max_speakers is not None:
+                diar_kwargs["max_speakers"] = args.max_speakers
+
+        if diar_kwargs:
+            print(f"[INFO] diarization speaker hint = {diar_kwargs}")
+        else:
+            print("[INFO] diarization speaker hint = (auto)")
+
+        diarize_segments = diarize_model(audio, **diar_kwargs)
+        result = whisperx.assign_word_speakers(diarize_segments, result)
+
+        # diarization 모델 메모리 해제
+        del diarize_model
+        cleanup_cuda()
+    else:
+        print("[INFO] diarization skipped (--no-diarize)")
+
+    # 5) 저장
+    rows = extract_timeline_rows(result)
+    if not rows:
+        raise RuntimeError("최종 결과 세그먼트가 없습니다. 오디오/모델/언어 설정을 확인하세요.")
+
+    write_outputs(out_dir, result, rows)
+
+    # 6) preview
     timeline_file = out_dir / "transcript_by_speaker_timeline.txt"
     print("\n=== PREVIEW (first 20 lines) ===")
     for line in timeline_file.read_text(encoding="utf-8").splitlines()[:20]:
